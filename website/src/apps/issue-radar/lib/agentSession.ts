@@ -26,7 +26,7 @@ import { useNavigate } from 'react-router-dom'
 import { useAppDispatch } from '../../../store'
 import { createSlot, switchSlot, deleteSlot } from '../../../store/chatSlice'
 import { api } from '../../../api/client'
-import { issueRadarApi, type InvestigationRecord, type ItemKind, RepoRef } from '../api'
+import { issueRadarApi, InvestigationSlotConflictError, type InvestigationRecord, type ItemKind, type RecordVerb, RepoRef } from '../api'
 
 /** One folder per connected repo groups all its sessions. */
 const FOLDER_PREFIX = 'Issue Radar - '
@@ -56,6 +56,41 @@ function isMissingSlot(e: unknown): boolean {
   return /\b404\b/.test(msg) || /not found/i.test(msg)
 }
 
+/** Release a link THIS tab claimed, when its first turn definitively never started.
+ *
+ * The expectation is our own slot key, so this can only ever clear OUR link — if
+ * another tab has since claimed the record, the write is refused rather than
+ * stealing it. Best-effort: failing to release leaves a resumable-but-empty
+ * session, which the user can still delete, so it must not mask the seed error
+ * that brought us here. */
+async function releaseClaim(
+  repoRef: RepoRef, number: number, kind: ItemKind, verb: RecordVerb | undefined, slotKey: string,
+): Promise<void> {
+  await issueRadarApi
+    .saveInvestigation(repoRef, number, { slot_key: '' }, kind, verb, slotKey)
+    .catch(() => {})
+}
+
+/** True once the slot has a turn (or one is running) — i.e. the seed landed.
+ *
+ * A thrown `sendChat` does NOT say whether the POST was accepted, and the two
+ * outcomes need opposite handling: a started session must never be destroyed, while
+ * an unstarted one must not keep the record's link or every retry resumes a session
+ * that never receives the prompt. So the slot itself is asked. An unanswerable probe
+ * counts as STARTED, because losing a running session is worse than leaving one
+ * empty session behind. */
+async function seedLanded(slotKey: string): Promise<boolean> {
+  try {
+    const detail = (await api.chatSlotDetail(slotKey)) as {
+      messages?: unknown[]
+      running?: boolean
+    }
+    return (detail?.messages?.length ?? 0) > 0 || detail?.running === true
+  } catch {
+    return true
+  }
+}
+
 export interface OpenSessionArgs {
   repoRef: RepoRef
   /** Issue OR change-request number. */
@@ -64,6 +99,11 @@ export interface OpenSessionArgs {
    * must pass `pull`, because on GitLab the two are numbered independently and a
    * shared record would resume the wrong session. */
   kind?: ItemKind
+  /** Which SESSION VERB this session is, when the item can carry more than one at
+   * a time. Omitted means the item's primary record. Two verbs sharing a record
+   * would share one `slot_key`, so the second click would resume the first verb's
+   * session and overwrite its link. */
+  verb?: RecordVerb
   /** Slot title, already formatted (e.g. "#123 · Fix the thing"). */
   title: string
   /** The fully-built seed prompt for the first turn. */
@@ -87,7 +127,7 @@ export function useAgentSession(): UseAgentSession {
   const [error, setError] = useState<Error | null>(null)
 
   const openSession = useCallback(
-    async ({ repoRef, number, kind = 'issue', title, prompt, existing }: OpenSessionArgs): Promise<InvestigationRecord | null> => {
+    async ({ repoRef, number, kind = 'issue', verb, title, prompt, existing }: OpenSessionArgs): Promise<InvestigationRecord | null> => {
       setBusy(true)
       // Set once a slot exists but is not yet linked to an investigation record;
       // cleared on success. See the rollback in the catch below.
@@ -112,7 +152,7 @@ export function useAgentSession(): UseAgentSession {
             if (!isMissingSlot(e)) throw e
           }
           if (resumed) {
-            const res = await issueRadarApi.saveInvestigation(repoRef, number, {}, kind)
+            const res = await issueRadarApi.saveInvestigation(repoRef, number, {}, kind, verb)
             navigate('/chat')
             return res.investigation
           }
@@ -132,29 +172,70 @@ export function useAgentSession(): UseAgentSession {
         createdSlotKey = slot.key
         // Best-effort readable title; the session works regardless.
         api.renameSlot(slot.key, title).catch(() => {})
+
+        // CLAIM THE RECORD BEFORE SEEDING. A re-entry guard lives in one tab and
+        // cannot see a click in another, so the only thing that can order two tabs
+        // is the record itself: the write proceeds only if the stored link is still
+        // what this tab last saw. Claiming first is what makes losing SAFE — the
+        // slot has no turn yet, so it can be removed, whereas a claim after the
+        // seed would leave a running agent to either destroy or orphan.
+        let claimed: InvestigationRecord | null
+        try {
+          const res = await issueRadarApi.saveInvestigation(repoRef, number, {
+            slot_key: slot.key,
+            folder_id: folderId,
+            status: 'investigating',
+          }, kind, verb, existing?.slot_key ?? null)
+          claimed = res.investigation
+        } catch (e) {
+          // Typed rather than message-sniffed: the api client parses the 409 body
+          // and hands back the live record.
+          if (!(e instanceof InvestigationSlotConflictError)) throw e
+          const winner = e.current
+          if (!winner?.slot_key) throw e
+          // Another tab won. Drop this tab's unseeded slot and adopt the winner's
+          // session, which is what the user wanted either way.
+          await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
+          createdSlotKey = null
+          await dispatch(switchSlot(winner.slot_key)).unwrap()
+          navigate('/chat')
+          return winner
+        }
+
         // Seed + auto-run the first turn (background task; persisted + survives
         // the navigation). await ensures the user message is stored before we
         // switch, so it paints immediately on arrival.
+        //
+        // Because the link is claimed ABOVE, a seed that never starts must also
+        // release that link — otherwise the record points at a slot with no turn,
+        // and every later click resumes that empty session instead of starting the
+        // work. That is the one cost of claiming first, and it is paid here.
+        let seeded: unknown
+        try {
+          const seedInFlight = api.sendChat(prompt, slot.key)
+          createdSlotKey = null
+          seeded = await seedInFlight
+        } catch (e) {
+          // A throw does not say whether the POST landed, so ask the slot.
+          if (!(await seedLanded(slot.key))) {
+            await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
+            await releaseClaim(repoRef, number, kind, verb, slot.key)
+          }
+          throw e
+        }
         // api.sendChat hands back the raw fetch response, and fetch RESOLVES on
         // 4xx/5xx — so without this check a rejected prompt still got recorded and
         // navigated to, leaving a resumable but empty session.
-        const seedInFlight = api.sendChat(prompt, slot.key)
-        createdSlotKey = null
-        const seeded = await seedInFlight
         if (seeded && typeof seeded === 'object' && 'ok' in seeded && !(seeded as Response).ok) {
           // Rejected outright, so nothing is running: the empty slot is safe (and
-          // wrong) to remove.
+          // wrong) to remove, and the link it claimed has to go with it.
           await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
+          await releaseClaim(repoRef, number, kind, verb, slot.key)
           throw new Error(`could not seed the session (HTTP ${(seeded as Response).status})`)
         }
-        const res = await issueRadarApi.saveInvestigation(repoRef, number, {
-          slot_key: slot.key,
-          folder_id: folderId,
-          status: 'investigating',
-        }, kind)
         await dispatch(switchSlot(slot.key)).unwrap().catch(() => {})
         navigate('/chat')
-        return res.investigation
+        return claimed
       } catch (e) {
         // Only ever removes a slot whose agent turn was never started (see
         // createdSlotKey above), so a retry does not stack up empty sessions and a
