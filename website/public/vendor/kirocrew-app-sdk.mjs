@@ -10,4 +10,6 @@ export const {
   // Chat surfaces and the transcript row registry.
   useChatSession, ChatPanel, ChatEmbed, ChatMessageList,
   defaultMessageRenderers, mergeRenderers, resolveRenderer, ToolCallPill, GROUPED_ROLES,
+  // The composer's draft behaviour, for an app that draws its own input box.
+  useComposerDraft, pickedFromDraft, draftByteSize,
 } = m

@@ -235,6 +235,68 @@ The registry takes no store and no router dependency, and reads live state only 
 it is handed — an app runs outside the dashboard's React root and has no store to select from. A row
 that genuinely needs live app state is supplied by the host as an entry.
 
+## Chat Composer Draft Behaviour
+
+`useComposerDraft` owns what happens to the text while the user is still writing it. Not the input
+box's markup — every surface is entitled to draw its own — but the behaviour behind it:
+
+```tsx
+import { useComposerDraft, deriveFollowUpOptions } from '@kirocrew/app-sdk'
+
+const { followUpOptions } = deriveFollowUpOptions(messages, running)
+const composer = useComposerDraft({ followUpOptions, maxBytes: 32_768 })
+
+<textarea
+  ref={composer.textareaRef}
+  {...composer.composition}
+  value={composer.draft}
+  onChange={e => composer.setDraft(e.target.value)}
+  onKeyDown={e => composer.submitOnEnter(e, send)}
+/>
+```
+
+Four behaviours are easy to get subtly wrong and are the reason this is shared rather than copied:
+
+- **A follow-up pick edits the draft**, and the picks are read back off the draft rather than kept
+  in a `Set` beside it. The draft is what gets submitted, so it is the only honest source, and a
+  choice stays amendable. An option the user has woven into their own sentence correctly stops
+  being a removable block.
+- **Text handed back is appended, never substituted.** A cancelled queue entry or a rejected submit
+  has no other home, and a half-written draft is typed work too — so neither may be dropped. The
+  append is the host's one implementation (`utils/chatDrafts.mergeIntoDraft`), not a private copy.
+- **An IME's committing Enter is not a submit.** The native `isComposing` flag is false on that
+  Enter in some browsers, so three signals are layered; spreading `composition` onto the element is
+  required for the third. Getting this wrong sends a half-written message with nothing to recover.
+- **The byte limit is measured in UTF-8 bytes.** A CJK or emoji draft is two to four times its
+  code-unit count, and the server measures the body.
+
+### Controlled or uncontrolled
+
+By default the hook holds the draft; pass `initialDraft` to seed it (read on first render only).
+A surface that already persists the text elsewhere — the dashboard's main composer keeps a draft per
+slot — passes `draft` + `onDraftChange` instead, and the hook then stores nothing. `setDraft` accepts
+an updater in both modes.
+
+### What it does NOT do
+
+- **It never sends.** `submitOnEnter` takes the caller's own submit.
+- **It never blocks a submit.** `maxBytes` only makes `exceedsByteLimit(text)` report true; the
+  surface decides what to do and owns the wording, which is why no copy lives here.
+- **It does not size a box it was not given.** Auto-grow runs only for an element attached to
+  `textareaRef`; a composer that sizes its own box (or is a single-line `<input>`) does not attach it.
+- **It holds no store, router or API dependency.** `submitOnEnter` and `isComposing` are generic over
+  the element, so an `<input>`-based composer is served as well as a `<textarea>`.
+
+### Exports
+
+| Export | Kind | Purpose |
+|---|---|---|
+| `useComposerDraft(options)` | hook | draft state plus the four behaviours above |
+| `pickedFromDraft(text, options)` | function | which offered options form the draft's tail |
+| `draftByteSize(text)` | function | UTF-8 byte length of a draft |
+| `ComposerDraft` | type | what the hook returns |
+| `ComposerDraftOptions` | type | `{ followUpOptions?, maxBytes?, maxHeight?, initialDraft?, draft?, onDraftChange? }` |
+
 ## Gateway API Surface
 
 The sections below document the canonical Gateway API surface as exposed by the

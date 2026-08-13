@@ -318,3 +318,10 @@ export {
   ToolCallPill,
 } from './messageRenderers'
 export type { MessageRenderer, MessageRenderContext } from './messageRenderers'
+// The composer's draft behaviour, so a surface can draw its own input box without
+// re-deriving what a follow-up pick, a handed-back submit, or an IME Enter mean.
+// No merge helper is re-exported here on purpose: the host already has exactly one
+// (`utils/chatDrafts.mergeIntoDraft`) and the hook consumes it, so a second name for
+// the same append cannot appear.
+export { useComposerDraft, pickedFromDraft, draftByteSize } from './useComposerDraft'
+export type { ComposerDraft, ComposerDraftOptions } from './useComposerDraft'
