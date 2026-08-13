@@ -73,7 +73,40 @@ describe('WeixinPanel — DM policy picker', () => {
 })
 
 
+/**
+ * WeChat channel panel — session folder.
+ *
+ * Queried the way `BotChannelPanel.sessionFolder.test.tsx` queries the other six
+ * channels — `role="switch"` by accessible name, the name field by its visible
+ * label — so this suite fails if the panel drifts back to hand-rolled markup
+ * instead of the shared `SettingsToggle` / `SettingsInput` primitives. The
+ * behaviour assertions are WeChat-specific because this panel alone has no Save
+ * button and must persist on change.
+ */
+const FOLDER_SWITCH = { name: 'File sessions in a folder' }
+
 describe('WeixinPanel — session folder', () => {
+  it('renders the shared switch, not a checkbox', async () => {
+    renderWithProviders(<WeixinPanel />)
+    const toggle = await screen.findByRole('switch', FOLDER_SWITCH)
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+    // The bare <input type="checkbox"> this replaced would satisfy no switch
+    // role, and the panel's own enable toggle must not be mistaken for it.
+    expect(toggle.tagName).not.toBe('INPUT')
+  })
+
+  it('sits below the allowlist, at the bottom of the panel', async () => {
+    // Placement is the actual bug: mid-panel it read as part of the
+    // access-policy block, so users looking where every other channel puts it
+    // concluded WeChat had no such setting.
+    vi.spyOn(api, 'getWeixinConfig').mockResolvedValue({ ...CONFIG, dm_policy: 'allowlist' })
+    renderWithProviders(<WeixinPanel />)
+
+    const allowlist = await screen.findByTestId('weixin-allowlist')
+    const folder = await screen.findByTestId('weixin-session-folder')
+    expect(allowlist.compareDocumentPosition(folder)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+  })
+
   it('enabling the toggle saves the default name immediately', async () => {
     // This panel has no Save button, so a toggle that only reveals the field
     // loses the setting for every user who turns it on, sees the name already
@@ -81,10 +114,9 @@ describe('WeixinPanel — session folder', () => {
     const save = vi.spyOn(api, 'saveWeixinConfig').mockResolvedValue({ ...CONFIG })
     renderWithProviders(<WeixinPanel />)
 
-    const toggle = await screen.findByTestId('weixin-session-folder-toggle')
-    fireEvent.click(toggle)
+    fireEvent.click(await screen.findByRole('switch', FOLDER_SWITCH))
 
-    expect(await screen.findByTestId('weixin-session-folder-name')).toBeTruthy()
+    expect(await screen.findByLabelText('Folder name')).toBeTruthy()
     await waitFor(() =>
       expect(save).toHaveBeenCalledWith({ session_folder: 'WeChat' }),
     )
@@ -95,20 +127,42 @@ describe('WeixinPanel — session folder', () => {
     const save = vi.spyOn(api, 'saveWeixinConfig').mockResolvedValue({ ...CONFIG })
     renderWithProviders(<WeixinPanel />)
 
-    fireEvent.click(await screen.findByTestId('weixin-session-folder-toggle'))
+    fireEvent.click(await screen.findByRole('switch', FOLDER_SWITCH))
 
     await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
     expect(save.mock.calls[0][0]).toEqual({ session_folder: 'WeChat' })
   })
 
-  it('saves the committed name when the field blurs', async () => {
+  it('saves the committed name when the field blurs, not per keystroke', async () => {
     const save = vi.spyOn(api, 'saveWeixinConfig').mockResolvedValue({ ...CONFIG })
     renderWithProviders(<WeixinPanel />)
 
-    fireEvent.click(await screen.findByTestId('weixin-session-folder-toggle'))
-    const input = await screen.findByTestId('weixin-session-folder-name')
+    fireEvent.click(await screen.findByRole('switch', FOLDER_SWITCH))
+    const input = await screen.findByLabelText('Folder name')
     fireEvent.change(input, { target: { value: 'Team chat' } })
+    // Typing alone must not save: only the toggle's own call has landed so far.
+    expect(save).toHaveBeenCalledTimes(1)
     fireEvent.blur(input)
+
+    await waitFor(() =>
+      expect(save).toHaveBeenLastCalledWith({ session_folder: 'Team chat' }),
+    )
+  })
+
+  it('commits the name on Enter', async () => {
+    // Enter is the only commit affordance a keyboard user has here — the panel
+    // has no Save button — so it must survive the move onto SettingsInput.
+    const save = vi.spyOn(api, 'saveWeixinConfig').mockResolvedValue({ ...CONFIG })
+    renderWithProviders(<WeixinPanel />)
+
+    fireEvent.click(await screen.findByRole('switch', FOLDER_SWITCH))
+    const input = await screen.findByLabelText('Folder name')
+    fireEvent.change(input, { target: { value: 'Team chat' } })
+    // Enter commits BY blurring, and jsdom only dispatches blur for the focused
+    // element — without this the assertion would pass on a no-op handler.
+    ;(input as HTMLInputElement).focus()
+    expect(document.activeElement).toBe(input)
+    fireEvent.keyDown(input, { key: 'Enter' })
 
     await waitFor(() =>
       expect(save).toHaveBeenLastCalledWith({ session_folder: 'Team chat' }),
@@ -124,33 +178,138 @@ describe('WeixinPanel — session folder', () => {
     const save = vi.spyOn(api, 'saveWeixinConfig').mockResolvedValue({ ...CONFIG })
     renderWithProviders(<WeixinPanel />)
 
-    const toggle = await screen.findByTestId('weixin-session-folder-toggle')
-    await waitFor(() => expect((toggle as HTMLInputElement).checked).toBe(true))
+    const toggle = await screen.findByRole('switch', FOLDER_SWITCH)
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'true'))
     fireEvent.click(toggle)
 
     await waitFor(() => expect(save).toHaveBeenCalledWith({ session_folder: '' }))
   })
 
-  it('shows the server error when a folder name is rejected', async () => {
-    vi.spyOn(api, 'saveWeixinConfig').mockRejectedValue(
-      new Error('Folder name cannot contain / or \\'),
-    )
+  it('keeps a custom name when the setting is switched off and back on', async () => {
+    // Off persists "" (the backend encodes off as an empty name), so the panel
+    // must hold the name locally across that round trip.
+    //
+    // The fixture is STATEFUL on purpose: a GET that keeps replying "Team chat"
+    // no matter what was saved models a server that never forgets, and passes
+    // even when the panel drops the name entirely. The refetch after the
+    // toggle-off save has to actually report the cleared value for this to
+    // assert anything.
+    let stored = 'Team chat'
+    vi.spyOn(api, 'getWeixinConfig').mockImplementation(async () => ({
+      ...CONFIG,
+      session_folder: stored,
+    }))
+    const save = vi.spyOn(api, 'saveWeixinConfig').mockImplementation(async patch => {
+      if (typeof patch.session_folder === 'string') stored = patch.session_folder
+      return { ...CONFIG }
+    })
     renderWithProviders(<WeixinPanel />)
 
-    fireEvent.click(await screen.findByTestId('weixin-session-folder-toggle'))
-    const input = await screen.findByTestId('weixin-session-folder-name')
+    const toggle = await screen.findByRole('switch', FOLDER_SWITCH)
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'true'))
+    fireEvent.click(toggle)
+    // Wait for the cleared value to come back from the refetch, which is the
+    // exact moment a naive re-seed would wipe the held name.
+    await waitFor(() => expect(save).toHaveBeenLastCalledWith({ session_folder: '' }))
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'false'))
+    fireEvent.click(toggle)
+
+    await waitFor(() =>
+      expect(save).toHaveBeenLastCalledWith({ session_folder: 'Team chat' }),
+    )
+  })
+
+  it('does not re-send a rejected name when the setting is switched off and back on', async () => {
+    // Without the accepted/draft split the rejected text is reused by the next
+    // enable: that save is rejected too, the revert hides the field it lives in,
+    // and the user has no way to correct it.
+    let stored = ''
+    vi.spyOn(api, 'getWeixinConfig').mockImplementation(async () => ({
+      ...CONFIG,
+      session_folder: stored,
+    }))
+    const save = vi.spyOn(api, 'saveWeixinConfig').mockImplementation(async patch => {
+      const v = patch.session_folder
+      if (typeof v === 'string' && v.includes('/')) throw new Error('Folder name cannot contain / or \\')
+      if (typeof v === 'string') stored = v
+      return { ...CONFIG }
+    })
+    renderWithProviders(<WeixinPanel />)
+
+    // Enable (stores "WeChat"), then type a name the server refuses.
+    fireEvent.click(await screen.findByRole('switch', FOLDER_SWITCH))
+    await waitFor(() => expect(save).toHaveBeenLastCalledWith({ session_folder: 'WeChat' }))
+    const input = await screen.findByLabelText('Folder name')
+    fireEvent.change(input, { target: { value: 'a/b' } })
+    fireEvent.blur(input)
+    await screen.findByTestId('weixin-session-folder-error')
+
+    // Off, then on: the enable must carry the accepted name, not the rejection.
+    const toggle = screen.getByRole('switch', FOLDER_SWITCH)
+    fireEvent.click(toggle)
+    await waitFor(() => expect(save).toHaveBeenLastCalledWith({ session_folder: '' }))
+    fireEvent.click(toggle)
+
+    await waitFor(() =>
+      expect(save).toHaveBeenLastCalledWith({ session_folder: 'WeChat' }),
+    )
+    expect(save).not.toHaveBeenLastCalledWith({ session_folder: 'a/b' })
+  })
+
+  it('surfaces a rejected toggle-off and snaps the switch back', async () => {
+    // The error node must live outside the folderOn block: a rejected toggle-OFF
+    // leaves folderOn false, so an error rendered inside it is never seen, and a
+    // switch left optimistically off claims sessions are unfiled while the
+    // gateway keeps filing them.
+    vi.spyOn(api, 'getWeixinConfig').mockResolvedValue({
+      ...CONFIG,
+      session_folder: 'WeChat',
+    })
+    vi.spyOn(api, 'saveWeixinConfig').mockRejectedValue(new Error('config is read-only'))
+    renderWithProviders(<WeixinPanel />)
+
+    const toggle = await screen.findByRole('switch', FOLDER_SWITCH)
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'true'))
+    fireEvent.click(toggle)
+
+    const err = await screen.findByTestId('weixin-session-folder-error')
+    expect(err.textContent).toContain('read-only')
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'true'))
+  })
+
+  it('shows the server error when a folder name is rejected', async () => {
+    // Reject ONLY the invalid name: a blanket reject would also fail the
+    // toggle-on save, whose revert unmounts the field before it can be typed in.
+    vi.spyOn(api, 'saveWeixinConfig').mockImplementation(async patch => {
+      if (typeof patch.session_folder === 'string' && patch.session_folder.includes('/')) {
+        throw new Error('Folder name cannot contain / or \\')
+      }
+      return { ...CONFIG }
+    })
+    renderWithProviders(<WeixinPanel />)
+
+    fireEvent.click(await screen.findByRole('switch', FOLDER_SWITCH))
+    const input = await screen.findByLabelText('Folder name')
     fireEvent.change(input, { target: { value: 'a/b' } })
     fireEvent.blur(input)
 
     const err = await screen.findByTestId('weixin-session-folder-error')
     expect(err.textContent).toContain('cannot contain')
+    // The name field must NOT be reverted on rejection — keeping the typed text
+    // is what lets the user correct it.
+    expect(screen.getByDisplayValue('a/b')).toBeInTheDocument()
   })
 
-  it('gives the name field a visible label, not just an aria-label', async () => {
-    // The other five channel panels render a visible caption; this one carried
-    // the meaning only in a placeholder that vanishes on first keystroke.
+  it('disables both controls when the config is read-only', async () => {
+    vi.spyOn(api, 'getWeixinConfig').mockResolvedValue({
+      ...CONFIG,
+      read_only: true,
+      session_folder: 'WeChat',
+    })
     renderWithProviders(<WeixinPanel />)
-    fireEvent.click(await screen.findByTestId('weixin-session-folder-toggle'))
-    expect(await screen.findByLabelText('Folder name')).toBeTruthy()
+
+    const toggle = await screen.findByRole('switch', FOLDER_SWITCH)
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-disabled', 'true'))
+    expect(await screen.findByLabelText('Folder name')).toBeDisabled()
   })
 })

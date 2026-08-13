@@ -113,6 +113,11 @@ interface SettingsInputProps {
   value: string
   onChange: (value: string) => void
   onBlur?: () => void
+  /** Key handler on the control itself. Needed by panels that commit on blur and
+   *  have no Save button (WeChat), where Enter must commit the value the way it
+   *  would in a form — a `<div>` wrapper cannot carry that without becoming an
+   *  interactive static element. */
+  onKeyDown?: React.KeyboardEventHandler<HTMLInputElement | HTMLTextAreaElement>
   placeholder?: string
   type?: 'text' | 'number'
   min?: number
@@ -125,7 +130,7 @@ interface SettingsInputProps {
   configKey?: string
 }
 
-export function SettingsInput({ label, description, hint, value, onChange, onBlur, placeholder, type = 'text', min, max, step, disabled, multiline, 'aria-label': ariaLabel, configKey }: SettingsInputProps) {
+export function SettingsInput({ label, description, hint, value, onChange, onBlur, onKeyDown, placeholder, type = 'text', min, max, step, disabled, multiline, 'aria-label': ariaLabel, configKey }: SettingsInputProps) {
   return (
     <SettingsField label={label} description={description} hint={hint} configKey={configKey}>
       {multiline ? (
@@ -133,6 +138,7 @@ export function SettingsInput({ label, description, hint, value, onChange, onBlu
           value={value}
           onChange={e => onChange(e.target.value)}
           onBlur={onBlur}
+          onKeyDown={onKeyDown}
           placeholder={placeholder}
           disabled={disabled}
           rows={3}
@@ -145,6 +151,7 @@ export function SettingsInput({ label, description, hint, value, onChange, onBlu
           value={value}
           onChange={e => onChange(e.target.value)}
           onBlur={onBlur}
+          onKeyDown={onKeyDown}
           placeholder={placeholder}
           min={min}
           max={max}
